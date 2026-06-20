@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{symbol_short, testutils::Address as _, token, Address, Env};
+use soroban_sdk::{symbol_short, testutils::{Address as _, Ledger as _}, token, Address, Env, Symbol};
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -384,4 +384,224 @@ fn test_full_integration_flow() {
     c.withdraw_platform_fees(&admin, &token_id, &treasury, &300);
     assert_eq!(tok.balance(&treasury), 300);
     assert_eq!(c.get_platform_fee_balance(&token_id), 0);
+}
+
+// ── bulk access purchase ──────────────────────────────────────────────────────
+
+/// Build a Vec<Symbol> and Vec<i128> from slices for test convenience.
+fn make_bulk(
+    env: &Env,
+    pairs: &[(&str, i128)],
+) -> (soroban_sdk::Vec<Symbol>, soroban_sdk::Vec<i128>) {
+    let mut ids = soroban_sdk::Vec::new(env);
+    let mut amts = soroban_sdk::Vec::new(env);
+    for (id, amt) in pairs {
+        ids.push_back(Symbol::new(env, id));
+        amts.push_back(*amt);
+    }
+    (ids, amts)
+}
+
+#[test]
+fn test_bulk_single_device_no_discount() {
+    // < 10 devices → no discount; user pays full price, credit stored at face value.
+    let (env, cid, token_id, _) = setup_with_fee(0);
+    let c = IotContractClient::new(&env, &cid);
+    let asset = token::StellarAssetClient::new(&env, &token_id);
+    let tok = token::Client::new(&env, &token_id);
+    let owner = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    c.init_device(&Symbol::new(&env, "dev1"), &500, &owner);
+    asset.mint(&user, &500);
+
+    let (ids, amts) = make_bulk(&env, &[("dev1", 500)]);
+    c.purchase_bulk_access(&user, &token_id, &ids, &amts);
+
+    // Contract holds the funds.
+    assert_eq!(tok.balance(&cid), 500);
+    assert_eq!(tok.balance(&user), 0);
+    // Credit stored at face value.
+    assert_eq!(c.get_credit(&user, &Symbol::new(&env, "dev1")), 500);
+}
+
+#[test]
+fn test_bulk_tier2_discount_10_devices() {
+    // 10 devices → 5 % discount; user pays 950 per 1000, credit = 1000.
+    let (env, cid, token_id, _) = setup_with_fee(0);
+    let c = IotContractClient::new(&env, &cid);
+    let asset = token::StellarAssetClient::new(&env, &token_id);
+    let tok = token::Client::new(&env, &token_id);
+    let owner = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    for i in 0..10_u32 {
+        let dev = Symbol::new(&env, match i {
+            0 => "d0", 1 => "d1", 2 => "d2", 3 => "d3", 4 => "d4",
+            5 => "d5", 6 => "d6", 7 => "d7", 8 => "d8", _ => "d9",
+        });
+        c.init_device(&dev, &1_000, &owner);
+    }
+
+    // Mint enough for 10 × 950 (after 5 % discount).
+    asset.mint(&user, &9_500);
+
+    let pairs: &[(&str, i128)] = &[
+        ("d0",1000),("d1",1000),("d2",1000),("d3",1000),("d4",1000),
+        ("d5",1000),("d6",1000),("d7",1000),("d8",1000),("d9",1000),
+    ];
+    let (ids, amts) = make_bulk(&env, pairs);
+    c.purchase_bulk_access(&user, &token_id, &ids, &amts);
+
+    // User spent 9500 (5 % off 10 000).
+    assert_eq!(tok.balance(&user), 0);
+    assert_eq!(tok.balance(&cid), 9_500);
+    // Each credit is still stored at face value (1000).
+    assert_eq!(c.get_credit(&user, &Symbol::new(&env, "d0")), 1_000);
+}
+
+#[test]
+fn test_bulk_credit_redeemed_on_request_access() {
+    // Buy a credit, then call request_access → credit consumed, owner paid from contract.
+    let (env, cid, token_id, _) = setup_with_fee(0);
+    let c = IotContractClient::new(&env, &cid);
+    let asset = token::StellarAssetClient::new(&env, &token_id);
+    let tok = token::Client::new(&env, &token_id);
+    let owner = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    c.init_device(&Symbol::new(&env, "dev1"), &1_000, &owner);
+    asset.mint(&user, &1_000);
+
+    let (ids, amts) = make_bulk(&env, &[("dev1", 1_000)]);
+    c.purchase_bulk_access(&user, &token_id, &ids, &amts);
+
+    assert_eq!(c.get_credit(&user, &Symbol::new(&env, "dev1")), 1_000);
+
+    // request_access with amount=0 (credit should cover it).
+    assert!(c.request_access(&Symbol::new(&env, "dev1"), &user, &token_id, &0));
+
+    // Owner received funds from contract escrow.
+    assert_eq!(tok.balance(&owner), 1_000);
+    assert_eq!(tok.balance(&cid), 0);
+    // Credit consumed.
+    assert_eq!(c.get_credit(&user, &Symbol::new(&env, "dev1")), 0);
+}
+
+#[test]
+fn test_bulk_credit_partially_consumed() {
+    // Credit of 2000 for a 1000-price device: after one access, 1000 remains.
+    let (env, cid, token_id, _) = setup_with_fee(0);
+    let c = IotContractClient::new(&env, &cid);
+    let asset = token::StellarAssetClient::new(&env, &token_id);
+    let tok = token::Client::new(&env, &token_id);
+    let owner = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    c.init_device(&Symbol::new(&env, "dev1"), &1_000, &owner);
+    asset.mint(&user, &2_000);
+
+    let (ids, amts) = make_bulk(&env, &[("dev1", 2_000)]);
+    c.purchase_bulk_access(&user, &token_id, &ids, &amts);
+
+    assert!(c.request_access(&Symbol::new(&env, "dev1"), &user, &token_id, &0));
+    assert_eq!(tok.balance(&owner), 1_000);
+    assert_eq!(c.get_credit(&user, &Symbol::new(&env, "dev1")), 1_000);
+}
+
+#[test]
+fn test_bulk_credit_with_platform_fee() {
+    // 5 % fee: credit redeemed → owner gets 950, fee balance += 50.
+    let (env, cid, token_id, _) = setup(); // 5 %
+    let c = IotContractClient::new(&env, &cid);
+    let asset = token::StellarAssetClient::new(&env, &token_id);
+    let tok = token::Client::new(&env, &token_id);
+    let owner = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    c.init_device(&Symbol::new(&env, "dev1"), &1_000, &owner);
+    asset.mint(&user, &1_000);
+
+    let (ids, amts) = make_bulk(&env, &[("dev1", 1_000)]);
+    c.purchase_bulk_access(&user, &token_id, &ids, &amts);
+    assert!(c.request_access(&Symbol::new(&env, "dev1"), &user, &token_id, &0));
+
+    assert_eq!(tok.balance(&owner), 950);
+    assert_eq!(c.get_platform_fee_balance(&token_id), 50);
+}
+
+#[test]
+fn test_bulk_expired_credit_falls_back_to_payment() {
+    // In test builds CREDIT_TTL_LEDGERS = 100. Jump to ledger 200 (past TTL but within
+    // the contract instance TTL of 4096) so the instance is still live but the credit is not.
+    let (env, cid, token_id, _) = setup_with_fee(0);
+    let c = IotContractClient::new(&env, &cid);
+    let asset = token::StellarAssetClient::new(&env, &token_id);
+    let tok = token::Client::new(&env, &token_id);
+    let owner = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    c.init_device(&Symbol::new(&env, "dev1"), &1_000, &owner);
+    asset.mint(&user, &2_000); // 1000 for bulk credit + 1000 for fallback payment
+
+    let (ids, amts) = make_bulk(&env, &[("dev1", 1_000)]);
+    c.purchase_bulk_access(&user, &token_id, &ids, &amts);
+
+    // Jump past the 100-ledger test TTL without archiving the instance (stays < 4096).
+    env.ledger().set_sequence_number(200);
+
+    // request_access should fall back to regular payment (credit expired).
+    assert!(c.request_access(&Symbol::new(&env, "dev1"), &user, &token_id, &1_000));
+    assert_eq!(tok.balance(&owner), 1_000);
+}
+
+#[test]
+#[should_panic(expected = "device not registered")]
+fn test_bulk_unregistered_device_panics() {
+    let (env, cid, token_id, _) = setup_with_fee(0);
+    let c = IotContractClient::new(&env, &cid);
+    let asset = token::StellarAssetClient::new(&env, &token_id);
+    let user = Address::generate(&env);
+    asset.mint(&user, &1_000);
+
+    let (ids, amts) = make_bulk(&env, &[("ghost", 1_000)]);
+    c.purchase_bulk_access(&user, &token_id, &ids, &amts);
+}
+
+#[test]
+#[should_panic(expected = "amount below device price")]
+fn test_bulk_amount_below_price_panics() {
+    let (env, cid, token_id, _) = setup_with_fee(0);
+    let c = IotContractClient::new(&env, &cid);
+    let asset = token::StellarAssetClient::new(&env, &token_id);
+    let user = Address::generate(&env);
+    c.init_device(&Symbol::new(&env, "dev1"), &1_000, &Address::generate(&env));
+    asset.mint(&user, &500);
+
+    let (ids, amts) = make_bulk(&env, &[("dev1", 500)]);
+    c.purchase_bulk_access(&user, &token_id, &ids, &amts);
+}
+
+#[test]
+#[should_panic(expected = "empty device list")]
+fn test_bulk_empty_list_panics() {
+    let (env, cid, token_id, _) = setup_with_fee(0);
+    let user = Address::generate(&env);
+    let ids: soroban_sdk::Vec<Symbol> = soroban_sdk::Vec::new(&env);
+    let amts: soroban_sdk::Vec<i128> = soroban_sdk::Vec::new(&env);
+    IotContractClient::new(&env, &cid).purchase_bulk_access(&user, &token_id, &ids, &amts);
+}
+
+#[test]
+#[should_panic(expected = "device_ids and amounts length mismatch")]
+fn test_bulk_length_mismatch_panics() {
+    let (env, cid, token_id, _) = setup_with_fee(0);
+    let c = IotContractClient::new(&env, &cid);
+    let user = Address::generate(&env);
+    c.init_device(&Symbol::new(&env, "dev1"), &500, &Address::generate(&env));
+
+    let mut ids: soroban_sdk::Vec<Symbol> = soroban_sdk::Vec::new(&env);
+    ids.push_back(Symbol::new(&env, "dev1"));
+    let amts: soroban_sdk::Vec<i128> = soroban_sdk::Vec::new(&env);
+    c.purchase_bulk_access(&user, &token_id, &ids, &amts);
 }

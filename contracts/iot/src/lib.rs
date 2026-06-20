@@ -1,10 +1,24 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
+    contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol, Vec,
 };
 
 const FEE_DENOMINATOR: i128 = 10_000;
+/// Credit TTL: 30 days in ledgers (~5 s/ledger). In tests use a short TTL.
+#[cfg(not(test))]
+const CREDIT_TTL_LEDGERS: u32 = 518_400;
+#[cfg(test)]
+const CREDIT_TTL_LEDGERS: u32 = 100;
+
+// ── Discount tiers (device count thresholds) ─────────────────────────────────
+// ≥10 devices → 5 % off, ≥50 → 10 % off, ≥100 → 20 % off
+const TIER2_MIN: usize = 10;
+const TIER2_DISC_BPS: i128 = 500;
+const TIER3_MIN: usize = 50;
+const TIER3_DISC_BPS: i128 = 1_000;
+const TIER4_MIN: usize = 100;
+const TIER4_DISC_BPS: i128 = 2_000;
 
 /// Duration in ledgers for each subscription tier.
 /// Stellar produces ~1 ledger every 5 seconds.
@@ -28,32 +42,12 @@ pub struct DevicePrice {
     pub price: i128,
 }
 
-/// Subscription tier selecting duration and discount.
-#[contracttype]
-#[derive(Clone, PartialEq, Debug)]
-pub enum SubscriptionTier {
-    Daily,
-    Weekly,
-    Monthly,
-}
-
-/// On-chain subscription record.
+/// Per-user, per-device credit record.
 #[contracttype]
 #[derive(Clone)]
-pub struct Subscription {
-    /// The subscriber.
-    pub user: Address,
-    /// The device this subscription is for.
-    pub device_id: Symbol,
-    pub tier: SubscriptionTier,
-    /// Ledger sequence number when this subscription was created/last renewed.
-    pub start_ledger: u32,
-    /// Ledger sequence number when this subscription expires.
-    pub end_ledger: u32,
-    /// Amount paid (after discount, before platform fee).
-    pub amount_paid: i128,
-    /// Whether the subscription is active (not cancelled).
-    pub active: bool,
+pub struct Credit {
+    pub amount: i128,
+    pub expires_at: u32, // ledger sequence
 }
 
 #[contracttype]
@@ -63,8 +57,8 @@ pub enum DataKey {
     PlatformFeeBalance(Address),
     DevicePrice(Symbol),
     DeviceOwner(Symbol),
-    /// Keyed by (user_address, device_id) encoded as a tuple-style key.
-    Subscription(Address, Symbol),
+    /// Prepaid credits: (user, device_id) → Credit
+    Credit(Address, Symbol),
 }
 
 #[contract]
@@ -77,10 +71,8 @@ impl IotContract {
         if env.storage().instance().has(&DataKey::Admin) {
             panic!("already initialized");
         }
-
         admin.require_auth();
         Self::validate_platform_fee(platform_fee_bps);
-
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
             .instance()
@@ -91,7 +83,6 @@ impl IotContract {
     pub fn set_platform_fee(env: Env, admin: Address, platform_fee_bps: i128) {
         Self::require_admin(env.clone(), admin);
         Self::validate_platform_fee(platform_fee_bps);
-
         env.storage()
             .instance()
             .set(&DataKey::PlatformFeeBps, &platform_fee_bps);
@@ -118,9 +109,7 @@ impl IotContract {
         if price <= 0 {
             panic!("price must be positive");
         }
-
         owner.require_auth();
-
         env.storage()
             .instance()
             .set(&DataKey::DevicePrice(device_id.clone()), &price);
@@ -144,8 +133,114 @@ impl IotContract {
             .get(&DataKey::DeviceOwner(device_id))
     }
 
-    /// Process payment for device access, sending net revenue to the owner and retaining platform fees.
-    /// If the user has an active subscription, access is granted without an additional payment.
+    // ── Bulk access ──────────────────────────────────────────────────────────
+
+    /// Purchase bulk access credits for multiple devices in one transaction.
+    /// Volume discount applied to the total based on the number of devices.
+    /// Each credit is stored per (user, device_id) and expires after CREDIT_TTL_LEDGERS.
+    pub fn purchase_bulk_access(
+        env: Env,
+        user: Address,
+        token: Address,
+        device_ids: Vec<Symbol>,
+        amounts: Vec<i128>,
+    ) {
+        user.require_auth();
+
+        let n = device_ids.len() as usize;
+        if n == 0 {
+            panic!("empty device list");
+        }
+        if device_ids.len() != amounts.len() {
+            panic!("device_ids and amounts length mismatch");
+        }
+
+        // Compute discount bps based on number of devices purchased.
+        let discount_bps: i128 = if n >= TIER4_MIN {
+            TIER4_DISC_BPS
+        } else if n >= TIER3_MIN {
+            TIER3_DISC_BPS
+        } else if n >= TIER2_MIN {
+            TIER2_DISC_BPS
+        } else {
+            0
+        };
+
+        let expires_at = env.ledger().sequence() + CREDIT_TTL_LEDGERS;
+        let token_client = token::Client::new(&env, &token);
+        let contract_address = env.current_contract_address();
+
+        for i in 0..device_ids.len() {
+            let device_id = device_ids.get(i).unwrap();
+            let full_amount = amounts.get(i).unwrap();
+
+            if full_amount <= 0 {
+                panic!("amount must be positive");
+            }
+
+            let price = Self::get_device_price(env.clone(), device_id.clone());
+            if price <= 0 {
+                panic!("device not registered");
+            }
+            if full_amount < price {
+                panic!("amount below device price");
+            }
+
+            // Apply volume discount: user pays discounted amount, credit stored = full_amount.
+            let discount = full_amount * discount_bps / FEE_DENOMINATOR;
+            let charge = full_amount - discount;
+
+            // Transfer charge from user to contract (held as credit).
+            token_client.transfer(&user, &contract_address, &charge);
+
+            // Accumulate with any existing unexpired credit.
+            let key = DataKey::Credit(user.clone(), device_id.clone());
+            let existing: Credit = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or(Credit { amount: 0, expires_at: 0 });
+
+            let carry = if existing.expires_at >= env.ledger().sequence() {
+                existing.amount
+            } else {
+                0
+            };
+
+            env.storage().persistent().set(
+                &key,
+                &Credit {
+                    amount: carry + full_amount, // credit at face value
+                    expires_at,
+                },
+            );
+        }
+
+        env.events().publish(
+            (symbol_short!("bulk"), user.clone()),
+            (n as u32, discount_bps),
+        );
+    }
+
+    /// Return unexpired credit amount for (user, device_id). Returns 0 if expired.
+    pub fn get_credit(env: Env, user: Address, device_id: Symbol) -> i128 {
+        let key = DataKey::Credit(user, device_id);
+        let credit: Credit = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Credit { amount: 0, expires_at: 0 });
+        if credit.expires_at >= env.ledger().sequence() {
+            credit.amount
+        } else {
+            0
+        }
+    }
+
+    /// Process payment for device access.
+    /// If the user has an unexpired credit ≥ device price, the credit is consumed
+    /// and the stored funds are forwarded to the owner (minus platform fee);
+    /// otherwise the normal on-the-fly transfer path is used.
     pub fn request_access(
         env: Env,
         device_id: Symbol,
@@ -163,28 +258,76 @@ impl IotContract {
         }
 
         let price = Self::get_device_price(env.clone(), device_id.clone());
-        if price <= 0 || amount < price {
+        if price <= 0 {
             return false;
         }
 
         let owner = Self::get_device_owner(env.clone(), device_id.clone())
             .unwrap_or_else(|| panic!("device owner not found"));
         let fee_bps = Self::get_platform_fee(env.clone());
-        let platform_fee = amount * fee_bps / FEE_DENOMINATOR;
-        let owner_amount = amount - platform_fee;
         let contract_address = env.current_contract_address();
         let token_client = token::Client::new(&env, &token);
 
-        if owner_amount > 0 {
-            token_client.transfer(&user, &owner, &owner_amount);
-        }
-        if platform_fee > 0 {
-            token_client.transfer(&user, &contract_address, &platform_fee);
-            let fee_key = DataKey::PlatformFeeBalance(token.clone());
-            let current_fee_balance = Self::get_platform_fee_balance(env.clone(), token.clone());
-            env.storage()
-                .instance()
-                .set(&fee_key, &(current_fee_balance + platform_fee));
+        // Try to redeem credit first.
+        let credit_key = DataKey::Credit(user.clone(), device_id.clone());
+        let credit: Credit = env
+            .storage()
+            .persistent()
+            .get(&credit_key)
+            .unwrap_or(Credit { amount: 0, expires_at: 0 });
+
+        let use_credit = credit.expires_at >= env.ledger().sequence() && credit.amount >= price;
+
+        let (pay_amount, from_credit) = if use_credit {
+            (price, true)
+        } else {
+            if amount < price {
+                return false;
+            }
+            (amount, false)
+        };
+
+        let platform_fee = pay_amount * fee_bps / FEE_DENOMINATOR;
+        let owner_amount = pay_amount - platform_fee;
+
+        if from_credit {
+            // Funds are already held by the contract; forward them.
+            if owner_amount > 0 {
+                token_client.transfer(&contract_address, &owner, &owner_amount);
+            }
+            if platform_fee > 0 {
+                let fee_key = DataKey::PlatformFeeBalance(token.clone());
+                let bal = Self::get_platform_fee_balance(env.clone(), token.clone());
+                env.storage()
+                    .instance()
+                    .set(&fee_key, &(bal + platform_fee));
+            }
+            // Consume credit.
+            let remaining = credit.amount - price;
+            if remaining > 0 {
+                env.storage().persistent().set(
+                    &credit_key,
+                    &Credit {
+                        amount: remaining,
+                        expires_at: credit.expires_at,
+                    },
+                );
+            } else {
+                env.storage().persistent().remove(&credit_key);
+            }
+        } else {
+            // Normal path: transfer from user.
+            if owner_amount > 0 {
+                token_client.transfer(&user, &owner, &owner_amount);
+            }
+            if platform_fee > 0 {
+                token_client.transfer(&user, &contract_address, &platform_fee);
+                let fee_key = DataKey::PlatformFeeBalance(token.clone());
+                let bal = Self::get_platform_fee_balance(env.clone(), token.clone());
+                env.storage()
+                    .instance()
+                    .set(&fee_key, &(bal + platform_fee));
+            }
         }
 
         env.events().publish(
@@ -192,7 +335,7 @@ impl IotContract {
             (
                 user.clone(),
                 owner.clone(),
-                amount,
+                pay_amount,
                 owner_amount,
                 platform_fee,
             ),
@@ -407,13 +550,11 @@ impl IotContract {
         if amount <= 0 {
             panic!("withdraw amount must be positive");
         }
-
         let fee_key = DataKey::PlatformFeeBalance(token.clone());
         let current_fee_balance = Self::get_platform_fee_balance(env.clone(), token.clone());
         if amount > current_fee_balance {
             panic!("insufficient platform fees");
         }
-
         env.storage()
             .instance()
             .set(&fee_key, &(current_fee_balance - amount));
@@ -472,362 +613,4 @@ fn tier_to_u32(tier: SubscriptionTier) -> u32 {
 }
 
 #[cfg(test)]
-mod test {
-    use super::*;
-    use soroban_sdk::{testutils::Address as _, token, Address, Env};
-
-    fn setup() -> (
-        Env,
-        IotContractClient<'static>,
-        Address,
-        token::StellarAssetClient<'static>,
-        Address,
-    ) {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, IotContract);
-        let client = IotContractClient::new(&env, &contract_id);
-        let admin = Address::generate(&env);
-        let token_admin = Address::generate(&env);
-        let token_id = env
-            .register_stellar_asset_contract_v2(token_admin.clone())
-            .address();
-        let asset_client = token::StellarAssetClient::new(&env, &token_id);
-
-        client.initialize(&admin, &500i128);
-
-        (env, client, token_id, asset_client, admin)
-    }
-
-    // ─── Existing pay-per-use tests ──────────────────────────────────────────
-
-    #[test]
-    fn test_init_device() {
-        let (env, client, _, _, _) = setup();
-        let device_id = symbol_short!("device1");
-        let price = 1000i128;
-        let owner = Address::generate(&env);
-
-        client.init_device(&device_id, &price, &owner);
-
-        let stored_price = client.get_device_price(&device_id);
-        let stored_owner = client.get_device_owner(&device_id).unwrap();
-        assert_eq!(stored_price, price);
-        assert_eq!(stored_owner, owner);
-    }
-
-    #[test]
-    fn test_valid_payment_splits_revenue() {
-        let (env, client, token_id, asset_client, _) = setup();
-        let token_client = token::Client::new(&env, &token_id);
-        let device_id = symbol_short!("device1");
-        let price = 1000i128;
-        let owner = Address::generate(&env);
-        let user = Address::generate(&env);
-
-        client.init_device(&device_id, &price, &owner);
-        asset_client.mint(&user, &price);
-
-        let result = client.request_access(&device_id, &user, &token_id, &price);
-
-        assert!(result);
-        assert_eq!(token_client.balance(&owner), 950);
-        assert_eq!(token_client.balance(&client.address), 50);
-        assert_eq!(client.get_platform_fee_balance(&token_id), 50);
-    }
-
-    #[test]
-    fn test_invalid_payment_amount() {
-        let (env, client, token_id, asset_client, _) = setup();
-        let device_id = symbol_short!("device1");
-        let price = 1000i128;
-        let owner = Address::generate(&env);
-        let user = Address::generate(&env);
-
-        client.init_device(&device_id, &price, &owner);
-        asset_client.mint(&user, &500i128);
-
-        let result = client.request_access(&device_id, &user, &token_id, &500i128);
-        assert!(!result);
-    }
-
-    #[test]
-    fn test_nonexistent_device() {
-        let (_env, client, _, _, _) = setup();
-        let device_id = symbol_short!("unknown");
-
-        let price = client.get_device_price(&device_id);
-        let owner = client.get_device_owner(&device_id);
-        assert_eq!(price, 0);
-        assert!(owner.is_none());
-    }
-
-    #[test]
-    fn test_admin_withdraws_platform_fees() {
-        let (env, client, token_id, asset_client, admin) = setup();
-        let token_client = token::Client::new(&env, &token_id);
-        let device_id = symbol_short!("device1");
-        let price = 1000i128;
-        let owner = Address::generate(&env);
-        let user = Address::generate(&env);
-        let recipient = Address::generate(&env);
-        client.init_device(&device_id, &price, &owner);
-        asset_client.mint(&user, &price);
-        client.request_access(&device_id, &user, &token_id, &price);
-
-        client.withdraw_platform_fees(&admin, &token_id, &recipient, &50i128);
-
-        assert_eq!(token_client.balance(&recipient), 50);
-        assert_eq!(client.get_platform_fee_balance(&token_id), 0);
-    }
-
-    // ─── Subscription tests ──────────────────────────────────────────────────
-
-    /// Helper: compute expected subscription price to keep tests DRY.
-    fn expected_price(base_price: i128, tier: &SubscriptionTier) -> i128 {
-        let (count, discount_bps): (i128, i128) = match tier {
-            SubscriptionTier::Daily => (1, 1_000),
-            SubscriptionTier::Weekly => (7, 2_000),
-            SubscriptionTier::Monthly => (30, 3_000),
-        };
-        base_price * count * (10_000 - discount_bps) / 10_000
-    }
-
-    #[test]
-    fn test_subscribe_daily_stores_subscription() {
-        let (env, client, token_id, asset_client, _) = setup();
-        let device_id = symbol_short!("dev1");
-        let base_price = 1_000i128;
-        let owner = Address::generate(&env);
-        let user = Address::generate(&env);
-
-        client.init_device(&device_id, &base_price, &owner);
-
-        let price = expected_price(base_price, &SubscriptionTier::Daily);
-        asset_client.mint(&user, &price);
-
-        let sub = client.subscribe(&user, &device_id, &SubscriptionTier::Daily, &token_id, &price);
-
-        assert!(sub.active);
-        assert_eq!(sub.tier, SubscriptionTier::Daily);
-        assert_eq!(sub.amount_paid, price);
-        assert_eq!(sub.end_ledger, sub.start_ledger + LEDGERS_PER_DAY);
-    }
-
-    #[test]
-    fn test_subscribe_weekly_discount() {
-        let (env, client, token_id, asset_client, _) = setup();
-        let device_id = symbol_short!("dev2");
-        let base_price = 1_000i128;
-        let owner = Address::generate(&env);
-        let user = Address::generate(&env);
-
-        client.init_device(&device_id, &base_price, &owner);
-
-        // Weekly: 7 * 1000 * 0.80 = 5600
-        let expected = expected_price(base_price, &SubscriptionTier::Weekly);
-        assert_eq!(expected, 5_600);
-
-        asset_client.mint(&user, &expected);
-        let sub = client.subscribe(&user, &device_id, &SubscriptionTier::Weekly, &token_id, &expected);
-
-        assert_eq!(sub.amount_paid, 5_600);
-        assert_eq!(sub.end_ledger, sub.start_ledger + LEDGERS_PER_WEEK);
-    }
-
-    #[test]
-    fn test_subscribe_monthly_discount() {
-        let (env, client, token_id, asset_client, _) = setup();
-        let device_id = symbol_short!("dev3");
-        let base_price = 1_000i128;
-        let owner = Address::generate(&env);
-        let user = Address::generate(&env);
-
-        client.init_device(&device_id, &base_price, &owner);
-
-        // Monthly: 30 * 1000 * 0.70 = 21000
-        let expected = expected_price(base_price, &SubscriptionTier::Monthly);
-        assert_eq!(expected, 21_000);
-
-        asset_client.mint(&user, &expected);
-        let sub = client.subscribe(&user, &device_id, &SubscriptionTier::Monthly, &token_id, &expected);
-
-        assert_eq!(sub.amount_paid, 21_000);
-        assert_eq!(sub.end_ledger, sub.start_ledger + LEDGERS_PER_MONTH);
-    }
-
-    #[test]
-    #[should_panic(expected = "insufficient payment for subscription")]
-    fn test_subscribe_insufficient_amount_panics() {
-        let (env, client, token_id, asset_client, _) = setup();
-        let device_id = symbol_short!("dev4");
-        let base_price = 1_000i128;
-        let owner = Address::generate(&env);
-        let user = Address::generate(&env);
-
-        client.init_device(&device_id, &base_price, &owner);
-        asset_client.mint(&user, &100i128);
-
-        // Should panic — only 100 provided but daily costs 900
-        client.subscribe(&user, &device_id, &SubscriptionTier::Daily, &token_id, &100i128);
-    }
-
-    #[test]
-    fn test_verify_access_active_subscription() {
-        let (env, client, token_id, asset_client, _) = setup();
-        let device_id = symbol_short!("dev5");
-        let base_price = 1_000i128;
-        let owner = Address::generate(&env);
-        let user = Address::generate(&env);
-
-        client.init_device(&device_id, &base_price, &owner);
-
-        let price = expected_price(base_price, &SubscriptionTier::Daily);
-        asset_client.mint(&user, &price);
-        client.subscribe(&user, &device_id, &SubscriptionTier::Daily, &token_id, &price);
-
-        assert!(client.verify_access(&device_id, &user));
-    }
-
-    #[test]
-    fn test_verify_access_no_subscription() {
-        let (env, client, _, _, _) = setup();
-        let device_id = symbol_short!("dev6");
-        let user = Address::generate(&env);
-
-        assert!(!client.verify_access(&device_id, &user));
-    }
-
-    #[test]
-    fn test_request_access_skips_payment_for_subscriber() {
-        let (env, client, token_id, asset_client, _) = setup();
-        let token_client = token::Client::new(&env, &token_id);
-        let device_id = symbol_short!("dev7");
-        let base_price = 1_000i128;
-        let owner = Address::generate(&env);
-        let user = Address::generate(&env);
-
-        client.init_device(&device_id, &base_price, &owner);
-
-        let price = expected_price(base_price, &SubscriptionTier::Daily);
-        asset_client.mint(&user, &price);
-        client.subscribe(&user, &device_id, &SubscriptionTier::Daily, &token_id, &price);
-
-        // User has no extra tokens — but request_access should succeed via subscription
-        let balance_before = token_client.balance(&user);
-        let result = client.request_access(&device_id, &user, &token_id, &0i128);
-
-        assert!(result);
-        // Balance unchanged — no additional payment taken
-        assert_eq!(token_client.balance(&user), balance_before);
-    }
-
-    #[test]
-    fn test_cancel_subscription_returns_prorated_refund() {
-        let (env, client, token_id, asset_client, _) = setup();
-        let token_client = token::Client::new(&env, &token_id);
-        let device_id = symbol_short!("dev8");
-        let base_price = 1_000i128;
-        let owner = Address::generate(&env);
-        let user = Address::generate(&env);
-
-        client.init_device(&device_id, &base_price, &owner);
-
-        let price = expected_price(base_price, &SubscriptionTier::Daily);
-        // Mint enough for subscription plus refund reserve
-        asset_client.mint(&user, &price);
-        asset_client.mint(&client.address, &price); // contract holds refund reserve
-
-        client.subscribe(&user, &device_id, &SubscriptionTier::Daily, &token_id, &price);
-
-        // Cancel immediately — should refund nearly the full daily price
-        let refund = client.cancel_subscription(&user, &device_id, &token_id);
-
-        assert!(refund > 0, "expected a non-zero refund");
-
-        // Subscription should now be inactive
-        let sub = client.get_subscription(&user, &device_id).unwrap();
-        assert!(!sub.active);
-
-        // User should have received the refund
-        assert_eq!(token_client.balance(&user), refund);
-    }
-
-    #[test]
-    #[should_panic(expected = "subscription already cancelled")]
-    fn test_cancel_already_cancelled_subscription_panics() {
-        let (env, client, token_id, asset_client, _) = setup();
-        let device_id = symbol_short!("dev9");
-        let base_price = 1_000i128;
-        let owner = Address::generate(&env);
-        let user = Address::generate(&env);
-
-        client.init_device(&device_id, &base_price, &owner);
-
-        let price = expected_price(base_price, &SubscriptionTier::Daily);
-        asset_client.mint(&user, &price);
-        asset_client.mint(&client.address, &price);
-
-        client.subscribe(&user, &device_id, &SubscriptionTier::Daily, &token_id, &price);
-        client.cancel_subscription(&user, &device_id, &token_id);
-        // Second cancel should panic
-        client.cancel_subscription(&user, &device_id, &token_id);
-    }
-
-    #[test]
-    fn test_renew_extends_active_subscription() {
-        let (env, client, token_id, asset_client, _) = setup();
-        let device_id = symbol_short!("devA");
-        let base_price = 1_000i128;
-        let owner = Address::generate(&env);
-        let user = Address::generate(&env);
-
-        client.init_device(&device_id, &base_price, &owner);
-
-        let price = expected_price(base_price, &SubscriptionTier::Daily);
-        // Mint enough for two subscriptions
-        asset_client.mint(&user, &(price * 2));
-
-        let sub1 = client.subscribe(&user, &device_id, &SubscriptionTier::Daily, &token_id, &price);
-        let end_after_first = sub1.end_ledger;
-
-        let sub2 = client.renew_subscription(&user, &device_id, &token_id, &price);
-
-        // After renewal, end_ledger should be further out than the first subscription
-        assert!(sub2.end_ledger > end_after_first);
-        assert_eq!(sub2.end_ledger, end_after_first + LEDGERS_PER_DAY);
-    }
-
-    #[test]
-    fn test_get_subscription_returns_none_for_unknown() {
-        let (env, client, _, _, _) = setup();
-        let device_id = symbol_short!("devB");
-        let user = Address::generate(&env);
-
-        assert!(client.get_subscription(&user, &device_id).is_none());
-    }
-
-    #[test]
-    fn test_subscription_splits_revenue_to_owner_and_platform() {
-        let (env, client, token_id, asset_client, _) = setup();
-        let token_client = token::Client::new(&env, &token_id);
-        let device_id = symbol_short!("devC");
-        let base_price = 1_000i128;
-        let owner = Address::generate(&env);
-        let user = Address::generate(&env);
-
-        client.init_device(&device_id, &base_price, &owner);
-
-        // Daily: 1 * 1000 * 0.90 = 900
-        let price = expected_price(base_price, &SubscriptionTier::Daily);
-        assert_eq!(price, 900);
-        asset_client.mint(&user, &price);
-
-        client.subscribe(&user, &device_id, &SubscriptionTier::Daily, &token_id, &price);
-
-        // Platform fee = 900 * 500 / 10000 = 45
-        // Owner amount  = 900 - 45 = 855
-        assert_eq!(token_client.balance(&owner), 855);
-        assert_eq!(client.get_platform_fee_balance(&token_id), 45);
-    }
-}
+mod test;

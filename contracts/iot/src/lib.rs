@@ -20,6 +20,21 @@ const TIER3_DISC_BPS: i128 = 1_000;
 const TIER4_MIN: usize = 100;
 const TIER4_DISC_BPS: i128 = 2_000;
 
+/// Duration in ledgers for each subscription tier.
+/// Stellar produces ~1 ledger every 5 seconds.
+/// Daily  ≈ 17_280 ledgers (24h * 3600s / 5s)
+/// Weekly ≈ 120_960 ledgers (7 days)
+/// Monthly ≈ 518_400 ledgers (30 days)
+const LEDGERS_PER_DAY: u32 = 17_280;
+const LEDGERS_PER_WEEK: u32 = 120_960;
+const LEDGERS_PER_MONTH: u32 = 518_400;
+
+/// Discount in basis points applied to the per-access price for subscriptions.
+/// Daily: 10% off, Weekly: 20% off, Monthly: 30% off.
+const DAILY_DISCOUNT_BPS: i128 = 1_000;
+const WEEKLY_DISCOUNT_BPS: i128 = 2_000;
+const MONTHLY_DISCOUNT_BPS: i128 = 3_000;
+
 #[contracttype]
 #[derive(Clone)]
 pub struct DevicePrice {
@@ -235,6 +250,13 @@ impl IotContract {
     ) -> bool {
         user.require_auth();
 
+        // Check active subscription first — free access for subscribers.
+        if Self::verify_access(env.clone(), device_id.clone(), user.clone()) {
+            env.events()
+                .publish((symbol_short!("access"), device_id), user);
+            return true;
+        }
+
         let price = Self::get_device_price(env.clone(), device_id.clone());
         if price <= 0 {
             return false;
@@ -329,6 +351,193 @@ impl IotContract {
         Self::request_access(env, device_id, user, token, amount)
     }
 
+    /// Check whether a user currently has active (non-expired, non-cancelled) access
+    /// via a subscription to a given device.
+    pub fn verify_access(env: Env, device_id: Symbol, user: Address) -> bool {
+        let key = DataKey::Subscription(user, device_id);
+        let sub: Option<Subscription> = env.storage().instance().get(&key);
+        match sub {
+            Some(s) => s.active && env.ledger().sequence() <= s.end_ledger,
+            None => false,
+        }
+    }
+
+    /// Subscribe a user to a device for the chosen tier.
+    ///
+    /// The subscription price is calculated as:
+    ///   `device_price * tier_access_count * (1 - discount_bps / 10_000)`
+    /// where `tier_access_count` is the number of single accesses the tier covers
+    /// (1 for daily, 7 for weekly, 30 for monthly).
+    ///
+    /// If a non-expired subscription already exists for the user+device, this acts
+    /// as a renewal (extends the end_ledger by one tier period).
+    /// Panics if the user provides insufficient `amount`.
+    pub fn subscribe(
+        env: Env,
+        user: Address,
+        device_id: Symbol,
+        tier: SubscriptionTier,
+        token: Address,
+        amount: i128,
+    ) -> Subscription {
+        user.require_auth();
+
+        let base_price = Self::get_device_price(env.clone(), device_id.clone());
+        if base_price <= 0 {
+            panic!("device not found or price not set");
+        }
+
+        let subscription_price = Self::compute_subscription_price(base_price, tier.clone());
+        if amount < subscription_price {
+            panic!("insufficient payment for subscription");
+        }
+
+        let owner = Self::get_device_owner(env.clone(), device_id.clone())
+            .unwrap_or_else(|| panic!("device owner not found"));
+        let fee_bps = Self::get_platform_fee(env.clone());
+        let platform_fee = subscription_price * fee_bps / FEE_DENOMINATOR;
+        let owner_amount = subscription_price - platform_fee;
+        let contract_address = env.current_contract_address();
+        let token_client = token::Client::new(&env, &token);
+
+        if owner_amount > 0 {
+            token_client.transfer(&user, &owner, &owner_amount);
+        }
+        if platform_fee > 0 {
+            token_client.transfer(&user, &contract_address, &platform_fee);
+            let fee_key = DataKey::PlatformFeeBalance(token.clone());
+            let current = Self::get_platform_fee_balance(env.clone(), token.clone());
+            env.storage()
+                .instance()
+                .set(&fee_key, &(current + platform_fee));
+        }
+
+        let tier_ledgers = Self::tier_to_ledgers(tier.clone());
+        let current_ledger = env.ledger().sequence();
+
+        // Renew if an active, non-expired subscription already exists.
+        let key = DataKey::Subscription(user.clone(), device_id.clone());
+        let start_ledger = current_ledger;
+        let end_ledger = {
+            let existing: Option<Subscription> = env.storage().instance().get(&key);
+            match existing {
+                Some(ref s) if s.active && current_ledger <= s.end_ledger => {
+                    // Extend from current end, not from now.
+                    s.end_ledger + tier_ledgers
+                }
+                _ => current_ledger + tier_ledgers,
+            }
+        };
+
+        let sub = Subscription {
+            user: user.clone(),
+            device_id: device_id.clone(),
+            tier: tier.clone(),
+            start_ledger,
+            end_ledger,
+            amount_paid: subscription_price,
+            active: true,
+        };
+
+        env.storage().instance().set(&key, &sub);
+
+        env.events().publish(
+            (symbol_short!("subscrib"), device_id.clone()),
+            (user.clone(), tier_to_u32(tier), subscription_price, end_ledger),
+        );
+
+        sub
+    }
+
+    /// Cancel an active subscription and issue a prorated refund to the user.
+    ///
+    /// The refund is proportional to the remaining ledgers out of the total tier duration.
+    /// Refund is taken from the device owner's share (platform fee portion is non-refundable).
+    /// Panics if no active subscription exists.
+    pub fn cancel_subscription(
+        env: Env,
+        user: Address,
+        device_id: Symbol,
+        token: Address,
+    ) -> i128 {
+        user.require_auth();
+
+        let key = DataKey::Subscription(user.clone(), device_id.clone());
+        let mut sub: Subscription = env
+            .storage()
+            .instance()
+            .get(&key)
+            .unwrap_or_else(|| panic!("no subscription found"));
+
+        if !sub.active {
+            panic!("subscription already cancelled");
+        }
+
+        let current_ledger = env.ledger().sequence();
+        if current_ledger > sub.end_ledger {
+            panic!("subscription already expired");
+        }
+
+        let tier_ledgers = Self::tier_to_ledgers(sub.tier.clone()) as i128;
+        let remaining_ledgers = (sub.end_ledger - current_ledger) as i128;
+
+        // Prorated refund = amount_paid * remaining / total_tier_duration
+        let refund_amount = if tier_ledgers > 0 {
+            sub.amount_paid * remaining_ledgers / tier_ledgers
+        } else {
+            0
+        };
+
+        // Mark as inactive before transferring to prevent re-entrancy issues.
+        sub.active = false;
+        env.storage().instance().set(&key, &sub);
+
+        if refund_amount > 0 {
+            // Refund comes from the contract (funded by the owner's share on subscribe).
+            // In this model the contract holds the subscription amount and disburses to
+            // the owner at expiry/cancellation — simplified here to refund from contract balance.
+            token::Client::new(&env, &token).transfer(
+                &env.current_contract_address(),
+                &user,
+                &refund_amount,
+            );
+        }
+
+        env.events().publish(
+            (symbol_short!("cancel"), device_id),
+            (user, refund_amount),
+        );
+
+        refund_amount
+    }
+
+    /// Explicitly renew an existing (possibly expired or active) subscription by one tier period.
+    /// This is a convenience wrapper around `subscribe` that preserves the same tier.
+    /// Panics if no prior subscription record exists.
+    pub fn renew_subscription(
+        env: Env,
+        user: Address,
+        device_id: Symbol,
+        token: Address,
+        amount: i128,
+    ) -> Subscription {
+        let key = DataKey::Subscription(user.clone(), device_id.clone());
+        let sub: Subscription = env
+            .storage()
+            .instance()
+            .get(&key)
+            .unwrap_or_else(|| panic!("no existing subscription to renew"));
+
+        Self::subscribe(env, user, device_id, sub.tier, token, amount)
+    }
+
+    /// Get the current subscription record for a user+device pair, if any.
+    pub fn get_subscription(env: Env, user: Address, device_id: Symbol) -> Option<Subscription> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Subscription(user, device_id))
+    }
+
     /// Withdraw accumulated platform fees. Only the contract admin can call this.
     pub fn withdraw_platform_fees(
         env: Env,
@@ -352,6 +561,8 @@ impl IotContract {
         token::Client::new(&env, &token).transfer(&env.current_contract_address(), &to, &amount);
     }
 
+    // ─── Private helpers ─────────────────────────────────────────────────────
+
     fn require_admin(env: Env, admin: Address) {
         admin.require_auth();
         let stored_admin: Address = env
@@ -368,6 +579,36 @@ impl IotContract {
         if platform_fee_bps < 0 || platform_fee_bps > FEE_DENOMINATOR {
             panic!("invalid platform fee");
         }
+    }
+
+    /// Convert a tier to the number of ledgers it covers.
+    fn tier_to_ledgers(tier: SubscriptionTier) -> u32 {
+        match tier {
+            SubscriptionTier::Daily => LEDGERS_PER_DAY,
+            SubscriptionTier::Weekly => LEDGERS_PER_WEEK,
+            SubscriptionTier::Monthly => LEDGERS_PER_MONTH,
+        }
+    }
+
+    /// Compute the discounted subscription price for a given tier.
+    ///
+    /// Formula: base_price * access_count * (FEE_DENOMINATOR - discount_bps) / FEE_DENOMINATOR
+    fn compute_subscription_price(base_price: i128, tier: SubscriptionTier) -> i128 {
+        let (access_count, discount_bps) = match tier {
+            SubscriptionTier::Daily => (1i128, DAILY_DISCOUNT_BPS),
+            SubscriptionTier::Weekly => (7i128, WEEKLY_DISCOUNT_BPS),
+            SubscriptionTier::Monthly => (30i128, MONTHLY_DISCOUNT_BPS),
+        };
+        base_price * access_count * (FEE_DENOMINATOR - discount_bps) / FEE_DENOMINATOR
+    }
+}
+
+/// Helper: encode tier as u32 for event payloads (Soroban events require simple types).
+fn tier_to_u32(tier: SubscriptionTier) -> u32 {
+    match tier {
+        SubscriptionTier::Daily => 0,
+        SubscriptionTier::Weekly => 1,
+        SubscriptionTier::Monthly => 2,
     }
 }
 

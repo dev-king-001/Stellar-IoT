@@ -115,6 +115,7 @@ pub struct PaymentRequest {
     pub device_id: String,
     pub user_address: String,
     pub amount: f64,
+    pub tx_hash: String, // Stellar transaction hash to verify
 }
 
 #[derive(Debug, Serialize)]

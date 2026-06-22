@@ -54,3 +54,8 @@ export async function registerDevice(data: DeviceRegistrationForm): Promise<Devi
   if (!response.ok) throw new Error('Failed to register device')
   return response.json()
 }
+
+export function getTelemetryWsUrl(sessionId: string): string {
+  const wsBase = API_URL.replace(/^http/, 'ws')
+  return `${wsBase}/session/${sessionId}/telemetry`
+}

@@ -1,5 +1,5 @@
 use crate::models::{
-    Device, DeviceCategory, DeviceSearchQuery, DeviceSearchResponse, SortField, SortOrder,
+    Device, DeviceCategory, DeviceSearchQuery, DeviceSearchResponse, SortField, SortOrder, Session, TelemetryData,
 };
 use crate::stellar_service::StellarService;
 use lazy_static::lazy_static;
@@ -284,6 +284,174 @@ pub async fn verify_payment(
     STELLAR_SERVICE
         .verify_payment(tx_hash, device.price, user_address)
         .await
+}
+
+lazy_static! {
+    pub static ref SESSIONS: std::sync::RwLock<std::collections::HashMap<String, Session>> =
+        std::sync::RwLock::new(std::collections::HashMap::new());
+}
+
+pub fn create_session(device_id: String, user_address: String) -> Session {
+    let devices = get_mock_devices();
+    let device_name = devices
+        .iter()
+        .find(|d| d.id == device_id)
+        .map(|d| d.name.clone())
+        .unwrap_or_else(|| "Unknown Device".to_string());
+
+    let session = Session::new(device_id, device_name, user_address);
+    let mut sessions = SESSIONS.write().unwrap();
+    sessions.insert(session.id.clone(), session.clone());
+    session
+}
+
+pub fn get_session(id: &str) -> Option<Session> {
+    let sessions = SESSIONS.read().unwrap();
+    sessions.get(id).cloned()
+}
+
+pub fn get_sessions_by_user(user_address: &str) -> Vec<Session> {
+    let sessions = SESSIONS.read().unwrap();
+    sessions
+        .values()
+        .filter(|s| s.user_address == user_address)
+        .cloned()
+        .collect()
+}
+
+pub fn extend_session(id: &str, hours: i64) -> Result<Session, String> {
+    let mut sessions = SESSIONS.write().unwrap();
+    if let Some(session) = sessions.get_mut(id) {
+        if !session.active || session.expires_at < chrono::Utc::now() {
+            return Err("Session has expired".to_string());
+        }
+        session.expires_at = session.expires_at + chrono::Duration::hours(hours);
+        Ok(session.clone())
+    } else {
+        Err("Session not found".to_string())
+    }
+}
+
+pub fn end_session(id: &str) -> Result<(), String> {
+    let mut sessions = SESSIONS.write().unwrap();
+    if let Some(session) = sessions.get_mut(id) {
+        session.active = false;
+        Ok(())
+    } else {
+        Err("Session not found".to_string())
+    }
+}
+
+pub fn generate_telemetry_data(device_category: &DeviceCategory, ticks: u64) -> TelemetryData {
+    use std::collections::HashMap;
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut numeric_readings = HashMap::new();
+    let mut boolean_readings = HashMap::new();
+    let mut string_readings = HashMap::new();
+    let mut is_abnormal = false;
+
+    match device_category {
+        DeviceCategory::Climate | DeviceCategory::Environmental => {
+            // Temperature, Humidity
+            let base_temp = 22.0;
+            // Introduce a periodic abnormal reading every 15 ticks for demonstration
+            let temp = if ticks % 15 == 0 {
+                is_abnormal = true;
+                38.5 // Abnormal high temp
+            } else {
+                base_temp + (ticks as f64 * 0.1).sin() * 2.0 + rand_noise(ticks)
+            };
+            
+            let humidity = 45.0 + (ticks as f64 * 0.05).cos() * 5.0 + rand_noise(ticks);
+
+            numeric_readings.insert("temperature".to_string(), (temp * 10.0).round() / 10.0);
+            numeric_readings.insert("humidity".to_string(), (humidity * 10.0).round() / 10.0);
+
+            let hvac = temp > 23.0;
+            boolean_readings.insert("hvac_active".to_string(), hvac);
+            boolean_readings.insert("filter_clogged".to_string(), false);
+
+            string_readings.insert(
+                "status".to_string(),
+                if is_abnormal {
+                    "Critical: High Temperature!".to_string()
+                } else if hvac {
+                    "HVAC Cooling Active".to_string()
+                } else {
+                    "System Optimal".to_string()
+                }
+            );
+        }
+        DeviceCategory::Security | DeviceCategory::Access => {
+            // Motion Detector / Lock
+            // Let's trigger a security alarm every 20 ticks
+            let alarm = ticks % 20 == 0;
+            if alarm {
+                is_abnormal = true;
+            }
+
+            numeric_readings.insert("motion_count".to_string(), (ticks / 10) as f64);
+            numeric_readings.insert("battery_level".to_string(), (100.0 - (ticks as f64 * 0.01)).clamp(0.0, 100.0));
+
+            boolean_readings.insert("motion_detected".to_string(), alarm);
+            boolean_readings.insert("tamper_sensor".to_string(), false);
+            boolean_readings.insert("door_locked".to_string(), !alarm);
+
+            string_readings.insert(
+                "status".to_string(),
+                if alarm {
+                    "ALERT: Intrusion Detected!".to_string()
+                } else {
+                    "Secure".to_string()
+                }
+            );
+        }
+        _ => {
+            // Utility / other (e.g. Water Flow Sensor)
+            let leak = ticks % 18 == 0;
+            if leak {
+                is_abnormal = true;
+            }
+
+            let flow_rate = if leak {
+                15.4
+            } else if ticks % 5 == 0 {
+                0.0
+            } else {
+                3.2 + (ticks as f64 * 0.2).sin() * 0.5 + rand_noise(ticks)
+            };
+
+            numeric_readings.insert("flow_rate".to_string(), (flow_rate * 10.0).round() / 10.0);
+            numeric_readings.insert("total_flow".to_string(), (ticks as f64 * 0.5));
+
+            boolean_readings.insert("valve_open".to_string(), flow_rate > 0.0);
+            boolean_readings.insert("leak_detected".to_string(), leak);
+
+            string_readings.insert(
+                "status".to_string(),
+                if leak {
+                    "CRITICAL: Leak Detected!".to_string()
+                } else if flow_rate > 0.0 {
+                    "Flowing".to_string()
+                } else {
+                    "Idle (No Flow)".to_string()
+                }
+            );
+        }
+    }
+
+    TelemetryData {
+        timestamp: now,
+        numeric_readings,
+        boolean_readings,
+        string_readings,
+        is_abnormal,
+    }
+}
+
+fn rand_noise(ticks: u64) -> f64 {
+    // Deterministic pseudo-random noise based on ticks
+    ((ticks * 12345) % 100) as f64 / 500.0 - 0.1
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────

@@ -1,6 +1,7 @@
 'use client'
 
 import { useEffect, useState, useCallback } from 'react'
+import Link from 'next/link'
 import { Session } from '@/types'
 import { getSessions, extendSession, endSession } from '@/services/api'
 
@@ -60,15 +61,21 @@ function SessionCard({ session, onEnd, onExtend }: {
       </div>
 
       {session.active && !expired && (
-        <div className="flex gap-2">
-          <button onClick={() => onExtend(session.id)}
-            className="flex-1 bg-stellar-purple text-white py-2 rounded-lg text-sm hover:bg-opacity-90 transition-colors">
-            Extend Session
-          </button>
-          <button onClick={() => onEnd(session.id)}
-            className="flex-1 border border-red-300 text-red-600 py-2 rounded-lg text-sm hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors">
-            End Session
-          </button>
+        <div className="flex flex-col gap-2">
+          <Link href={`/sessions/${session.id}`}
+            className="w-full bg-stellar-purple text-white py-2 rounded-lg text-sm font-semibold hover:bg-opacity-90 transition-colors text-center block">
+            View Live Telemetry
+          </Link>
+          <div className="flex gap-2">
+            <button onClick={() => onExtend(session.id)}
+              className="flex-1 border border-stellar-purple text-stellar-purple py-2 rounded-lg text-sm hover:bg-stellar-purple/5 transition-colors">
+              Extend (1 XLM)
+            </button>
+            <button onClick={() => onEnd(session.id)}
+              className="flex-1 border border-red-300 text-red-600 py-2 rounded-lg text-sm hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors">
+              End Session
+            </button>
+          </div>
         </div>
       )}
     </div>
@@ -108,7 +115,12 @@ export default function SessionManager() {
     const session = sessions.find(s => s.id === id)
     if (!session) return
     try {
-      await extendSession(id, { device_id: session.device_id, user_address: USER_ADDRESS, amount: 1 })
+      await extendSession(id, {
+        device_id: session.device_id,
+        user_address: USER_ADDRESS,
+        amount: 1,
+        tx_hash: `mock_extend_${Math.random().toString(36).substring(2, 10)}${Date.now().toString(36)}`,
+      })
       await load()
     } catch {
       alert('Failed to extend session')

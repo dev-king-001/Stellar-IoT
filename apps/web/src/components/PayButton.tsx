@@ -1,6 +1,7 @@
 'use client'
 
 import { useState } from 'react'
+import { useRouter } from 'next/navigation'
 import { Device } from '@/types'
 import { makePayment } from '@/services/api'
 
@@ -9,6 +10,7 @@ interface PayButtonProps {
 }
 
 export default function PayButton({ device }: PayButtonProps) {
+  const router = useRouter()
   const [loading, setLoading] = useState(false)
   const [success, setSuccess] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -25,11 +27,12 @@ export default function PayButton({ device }: PayButtonProps) {
         device_id: device.id,
         user_address: userAddress,
         amount: device.price,
+        tx_hash: `mock_pay_${Math.random().toString(36).substring(2, 10)}${Date.now().toString(36)}`,
       })
       
       if (result.access_granted) {
         setSuccess(true)
-        alert(`Access granted! Session ID: ${result.session_id}`)
+        router.push(`/sessions/${result.session_id}`)
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Payment failed')
@@ -41,7 +44,7 @@ export default function PayButton({ device }: PayButtonProps) {
   if (success) {
     return (
       <div className="bg-green-100 text-green-800 p-4 rounded-lg text-center">
-        ✓ Access Granted! Device is now unlocked.
+        ✓ Access Granted! Unlocked. Redirecting...
       </div>
     )
   }

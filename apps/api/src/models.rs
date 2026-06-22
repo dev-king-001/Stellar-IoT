@@ -125,6 +125,12 @@ pub struct PaymentResponse {
     pub expires_at: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct PaymentError {
+    pub code: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Session {
     pub id: String,

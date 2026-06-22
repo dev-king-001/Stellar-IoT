@@ -31,6 +31,12 @@ export default function DeviceCard({ device }: DeviceCardProps) {
         >
           View Details
         </Link>
+        <Link
+          href={`/analytics/${device.id}`}
+          className="block w-full text-center mt-2 border border-indigo-400 text-indigo-600 dark:text-indigo-400 py-2 rounded-lg hover:bg-indigo-50 dark:hover:bg-indigo-900/20 transition-colors text-sm"
+        >
+          Analytics
+        </Link>
       </div>
     </div>
   )

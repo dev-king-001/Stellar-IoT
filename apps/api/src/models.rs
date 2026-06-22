@@ -151,3 +151,79 @@ impl Session {
         }
     }
 }
+
+// ─── Analytics ───────────────────────────────────────────────────────────────
+
+/// Granularity for revenue / session time-series.
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportPeriod {
+    #[default]
+    Daily,
+    Weekly,
+    Monthly,
+}
+
+/// Query parameters for `GET /devices/:id/analytics`.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct AnalyticsQuery {
+    /// Time-series granularity: daily | weekly | monthly  (default: daily)
+    #[serde(default)]
+    pub period: ReportPeriod,
+    /// How many periods to look back (default: 30 for daily, 12 for weekly/monthly).
+    pub lookback: Option<usize>,
+    /// Export format: json | csv  (default: json)
+    pub format: Option<String>,
+}
+
+/// One data point in a revenue or session time-series.
+#[derive(Debug, Clone, Serialize)]
+pub struct TimeSeriesPoint {
+    /// ISO-8601 date label for the period start (YYYY-MM-DD).
+    pub date: String,
+    pub revenue: f64,
+    pub session_count: u64,
+    pub unique_users: u64,
+}
+
+/// Aggregated peak-usage hour row.
+#[derive(Debug, Clone, Serialize)]
+pub struct PeakHour {
+    /// Hour of the day in UTC (0–23).
+    pub hour: u8,
+    pub session_count: u64,
+}
+
+/// Retention cohort: for users who first accessed the device N periods ago,
+/// how many returned in subsequent periods?
+#[derive(Debug, Clone, Serialize)]
+pub struct RetentionRow {
+    /// Cohort label (e.g., "2025-01-06").
+    pub cohort: String,
+    /// Number of users who first accessed the device in this cohort.
+    pub new_users: u64,
+    /// Number who came back at least once after the cohort period.
+    pub returning_users: u64,
+    pub retention_rate: f64,
+}
+
+/// Full analytics report for a single device.
+#[derive(Debug, Serialize)]
+pub struct DeviceAnalyticsReport {
+    pub device_id: String,
+    pub period: String,
+    /// Total revenue over the lookback window (XLM).
+    pub total_revenue: f64,
+    /// Total sessions in the lookback window.
+    pub total_sessions: u64,
+    /// Total unique users in the lookback window.
+    pub total_unique_users: u64,
+    /// Average session duration in seconds.
+    pub avg_session_duration_secs: f64,
+    /// Revenue / sessions / unique-users time-series.
+    pub time_series: Vec<TimeSeriesPoint>,
+    /// Top-5 peak usage hours (UTC).
+    pub peak_hours: Vec<PeakHour>,
+    /// Simple two-period retention cohort analysis.
+    pub retention: Vec<RetentionRow>,
+}

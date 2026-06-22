@@ -26,27 +26,35 @@ pub async fn search_devices(
     Json(services::search_devices(&query))
 }
 
-/// Process payment and grant access.
+/// Process payment and grant access with Stellar verification.
 pub async fn process_payment(
     Json(payment): Json<PaymentRequest>,
 ) -> Result<Json<PaymentResponse>, StatusCode> {
-    let device = services::get_mock_devices()
-        .into_iter()
-        .find(|d| d.id == payment.device_id)
-        .ok_or(StatusCode::NOT_FOUND)?;
-
-    if payment.amount < device.price {
-        return Err(StatusCode::BAD_REQUEST);
+    // 1. Verify payment on Stellar
+    match services::verify_payment(
+        &payment.tx_hash,
+        &payment.device_id,
+        &payment.user_address,
+    ).await {
+        Ok(true) => {
+            // Payment verified - grant access
+            let session = Session::new(payment.device_id, payment.user_address);
+            Ok(Json(PaymentResponse {
+                access_granted: true,
+                session_id: session.id,
+                expires_at: session.expires_at.to_rfc3339(),
+            }))
+        }
+        Ok(false) => {
+            // Replay attack detected
+            Err(StatusCode::CONFLICT)
+        }
+        Err(msg) => {
+            // Verification failed
+            eprintln!("Payment verification failed: {}", msg);
+            Err(StatusCode::BAD_REQUEST)
+        }
     }
-
-    // TODO: Call Soroban smart contract to validate payment.
-    let session = Session::new(payment.device_id, payment.user_address);
-
-    Ok(Json(PaymentResponse {
-        access_granted: true,
-        session_id: session.id,
-        expires_at: session.expires_at.to_rfc3339(),
-    }))
 }
 
 /// Get session details.

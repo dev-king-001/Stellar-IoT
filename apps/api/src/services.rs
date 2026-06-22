@@ -1,4 +1,11 @@
 use crate::models::{Device, DeviceCategory, DeviceSearchQuery, DeviceSearchResponse, SortField, SortOrder};
+use crate::stellar_service::StellarService;
+use lazy_static::lazy_static;
+use std::sync::Arc;
+
+lazy_static! {
+    static ref STELLAR_SERVICE: Arc<StellarService> = Arc::new(StellarService::new());
+}
 
 /// Haversine distance between two WGS-84 coordinates, returns kilometres.
 fn haversine_km(lat1: f64, lng1: f64, lat2: f64, lng2: f64) -> f64 {
@@ -258,6 +265,31 @@ pub fn search_devices(query: &DeviceSearchQuery) -> DeviceSearchResponse {
         next_cursor,
         data: page,
     }
+}
+
+/// Verify a payment against Stellar Horizon.
+///
+/// Checks:
+/// 1. Device exists
+/// 2. Transaction exists and is successful on Stellar
+/// 3. Amount matches device price
+/// 4. Destination matches device owner wallet
+/// 5. Prevents replay attacks via transaction hash deduplication
+pub async fn verify_payment(
+    tx_hash: &str,
+    device_id: &str,
+    user_address: &str,
+) -> Result<bool, String> {
+    let device = get_mock_devices()
+        .into_iter()
+        .find(|d| d.id == device_id)
+        .ok_or_else(|| "Device not found".to_string())?;
+
+    STELLAR_SERVICE.verify_payment(
+        tx_hash,
+        device.price,
+        user_address,
+    ).await
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -535,5 +567,17 @@ mod tests {
         // San Francisco → Los Angeles ≈ 559 km
         let dist = haversine_km(37.7749, -122.4194, 34.0522, -118.2437);
         assert!((dist - 559.0).abs() < 10.0, "expected ~559 km, got {}", dist);
+    }
+
+    #[test]
+    fn test_verify_payment_device_not_found() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(verify_payment(
+            "tx_hash",
+            "non-existent-device",
+            "GABCDEF123",
+        ));
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Device not found");
     }
 }

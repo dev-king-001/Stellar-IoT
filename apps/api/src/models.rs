@@ -179,6 +179,8 @@ pub struct TelemetryData {
     pub boolean_readings: std::collections::HashMap<String, bool>,
     pub string_readings: std::collections::HashMap<String, String>,
     pub is_abnormal: bool,
+}
+
 // ─── Analytics ───────────────────────────────────────────────────────────────
 
 /// Granularity for revenue / session time-series.

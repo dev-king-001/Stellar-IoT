@@ -1,13 +1,12 @@
 use crate::analytics;
 use crate::models::{
     AnalyticsQuery, Device, DeviceSearchQuery, DeviceSearchResponse,
-    PaymentRequest, PaymentResponse, Session, HeartbeatRequest,
+    PaymentRequest, PaymentResponse, Session, HeartbeatRequest, TelemetryUpload,
 };
 use crate::services;
 use crate::webhook::WebhookEventType;
 use crate::webhook_service::{dispatch_event, WebhookStore};
 use axum::{
-    extract::{Path, Query, ws::{WebSocketUpgrade, WebSocket, Message}},
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Path, Query, State,
@@ -138,26 +137,25 @@ pub async fn telemetry_ws(
 
 /// Send live telemetry data packets to the client.
 async fn handle_telemetry_socket(mut socket: WebSocket, session_id: String) {
-    let session = match services::get_session(&session_id) {
-        Some(s) => s,
+    // Verify session exists
+    let device_id = match services::get_session(&session_id) {
+        Some(s) => s.device_id,
         None => {
             let _ = socket.send(Message::Text("Session not found".to_string())).await;
             return;
         }
     };
 
-    let device_category = services::get_mock_devices()
-        .into_iter()
-        .find(|d| d.id == session.device_id)
-        .map(|d| d.category)
-        .unwrap_or(crate::models::DeviceCategory::Climate);
-
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(1500));
-    let mut ticks = 0;
+    let mut rx = services::get_telemetry_receiver(&device_id);
 
     loop {
         tokio::select! {
-            _ = interval.tick() => {
+            result = rx.recv() => {
+                let data = match result {
+                    Ok(data) => data,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                };
                 let current_session = match services::get_session(&session_id) {
                     Some(s) => s,
                     None => break,
@@ -172,8 +170,6 @@ async fn handle_telemetry_socket(mut socket: WebSocket, session_id: String) {
                     break;
                 }
 
-                ticks += 1;
-                let data = services::generate_telemetry_data(&device_category, ticks);
                 if let Ok(msg_text) = serde_json::to_string(&data) {
                     if socket.send(Message::Text(msg_text)).await.is_err() {
                         break;
@@ -243,4 +239,14 @@ pub async fn device_heartbeat(
         Err(_) => Err(StatusCode::NOT_FOUND),
     }
 }
+/// Process telemetry upload from device.
+pub async fn upload_telemetry(
+    Path(id): Path<String>,
+    Json(payload): Json<TelemetryUpload>,
+) -> Result<StatusCode, StatusCode> {
+    if !services::has_active_session(&id) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    services::ingest_telemetry(&id, payload.readings);
+    Ok(StatusCode::ACCEPTED)
 }

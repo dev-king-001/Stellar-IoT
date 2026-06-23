@@ -1,6 +1,7 @@
 use crate::models::{
     Device, DeviceCategory, DeviceSearchQuery, DeviceSearchResponse, SortField, SortOrder, Session, TelemetryData, DeviceStatus,
 };
+use tokio::sync::broadcast;
 use crate::stellar_service::StellarService;
 use lazy_static::lazy_static;
 use std::sync::Arc;
@@ -335,6 +336,12 @@ pub fn check_offline_devices() {
 lazy_static! {
     pub static ref SESSIONS: std::sync::RwLock<std::collections::HashMap<String, Session>> =
         std::sync::RwLock::new(std::collections::HashMap::new());
+
+    pub static ref TELEMETRY_STORE: std::sync::RwLock<std::collections::HashMap<String, Vec<TelemetryData>>> =
+        std::sync::RwLock::new(std::collections::HashMap::new());
+
+    pub static ref TELEMETRY_CHANNELS: std::sync::RwLock<std::collections::HashMap<String, broadcast::Sender<TelemetryData>>> =
+        std::sync::RwLock::new(std::collections::HashMap::new());
 }
 
 pub fn create_session(device_id: String, user_address: String) -> Session {
@@ -386,6 +393,43 @@ pub fn end_session(id: &str) -> Result<(), String> {
     } else {
         Err("Session not found".to_string())
     }
+}
+
+pub fn has_active_session(device_id: &str) -> bool {
+    let sessions = SESSIONS.read().unwrap();
+    let now = chrono::Utc::now();
+    sessions.values().any(|s| s.device_id == device_id && s.active && s.expires_at > now)
+}
+
+pub fn ingest_telemetry(device_id: &str, data: Vec<TelemetryData>) {
+    // Store data
+    {
+        let mut store = TELEMETRY_STORE.write().unwrap();
+        let records = store.entry(device_id.to_string()).or_insert_with(Vec::new);
+        records.extend(data.clone());
+    }
+
+    // Broadcast data
+    let tx = {
+        let mut channels = TELEMETRY_CHANNELS.write().unwrap();
+        channels.entry(device_id.to_string()).or_insert_with(|| {
+            let (tx, _) = broadcast::channel(100);
+            tx
+        }).clone()
+    };
+
+    for item in data {
+        let _ = tx.send(item);
+    }
+}
+
+pub fn get_telemetry_receiver(device_id: &str) -> broadcast::Receiver<TelemetryData> {
+    let mut channels = TELEMETRY_CHANNELS.write().unwrap();
+    let tx = channels.entry(device_id.to_string()).or_insert_with(|| {
+        let (tx, _) = broadcast::channel(100);
+        tx
+    });
+    tx.subscribe()
 }
 
 pub fn generate_telemetry_data(device_category: &DeviceCategory, ticks: u64) -> TelemetryData {

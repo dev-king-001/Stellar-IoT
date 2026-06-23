@@ -172,13 +172,18 @@ impl Session {
 
 // ─── Telemetry Data ──────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TelemetryData {
     pub timestamp: String,
     pub numeric_readings: std::collections::HashMap<String, f64>,
     pub boolean_readings: std::collections::HashMap<String, bool>,
     pub string_readings: std::collections::HashMap<String, String>,
     pub is_abnormal: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TelemetryUpload {
+    pub readings: Vec<TelemetryData>,
 }
 
 // ─── Analytics ───────────────────────────────────────────────────────────────

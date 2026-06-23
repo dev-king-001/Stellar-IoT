@@ -12,6 +12,8 @@ pub fn device_routes() -> Router {
         .route("/session/:id", get(handlers::get_session).delete(handlers::end_session))
         .route("/session/:id/extend", post(handlers::extend_session))
         .route("/session/:id/telemetry", get(handlers::telemetry_ws))
+        .route("/devices/:id/analytics", get(handlers::get_device_analytics))
+        .route("/session/:id", get(handlers::get_session))
 }
 
 pub fn payment_routes() -> Router {

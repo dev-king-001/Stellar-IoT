@@ -58,4 +58,26 @@ export async function registerDevice(data: DeviceRegistrationForm): Promise<Devi
 export function getTelemetryWsUrl(sessionId: string): string {
   const wsBase = API_URL.replace(/^http/, 'ws')
   return `${wsBase}/session/${sessionId}/telemetry`
+import { DeviceAnalyticsReport, ReportPeriod } from '@/types'
+
+export async function getDeviceAnalytics(
+  deviceId: string,
+  period: ReportPeriod = 'daily',
+  lookback?: number,
+): Promise<DeviceAnalyticsReport> {
+  const params = new URLSearchParams({ period })
+  if (lookback) params.set('lookback', String(lookback))
+  const response = await fetch(`${API_URL}/devices/${deviceId}/analytics?${params}`)
+  if (!response.ok) throw new Error('Failed to fetch analytics')
+  return response.json()
+}
+
+export function getAnalyticsCsvUrl(
+  deviceId: string,
+  period: ReportPeriod = 'daily',
+  lookback?: number,
+): string {
+  const params = new URLSearchParams({ period, format: 'csv' })
+  if (lookback) params.set('lookback', String(lookback))
+  return `${API_URL}/devices/${deviceId}/analytics?${params}`
 }

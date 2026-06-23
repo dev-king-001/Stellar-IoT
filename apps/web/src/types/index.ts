@@ -48,3 +48,38 @@ export interface DeviceRegistrationResponse {
   name: string
   message: string
 }
+
+// ─── Analytics ───────────────────────────────────────────────────────────────
+
+export type ReportPeriod = 'daily' | 'weekly' | 'monthly'
+
+export interface TimeSeriesPoint {
+  date: string
+  revenue: number
+  session_count: number
+  unique_users: number
+}
+
+export interface PeakHour {
+  hour: number
+  session_count: number
+}
+
+export interface RetentionRow {
+  cohort: string
+  new_users: number
+  returning_users: number
+  retention_rate: number
+}
+
+export interface DeviceAnalyticsReport {
+  device_id: string
+  period: ReportPeriod
+  total_revenue: number
+  total_sessions: number
+  total_unique_users: number
+  avg_session_duration_secs: number
+  time_series: TimeSeriesPoint[]
+  peak_hours: PeakHour[]
+  retention: RetentionRow[]
+}

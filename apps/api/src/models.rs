@@ -182,8 +182,9 @@ pub struct TelemetryData {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct TelemetryUpload {
-    pub readings: Vec<TelemetryData>,
+pub struct TelemetryUploadRequest {
+    pub session_id: String,
+    pub data: Vec<TelemetryData>,
 }
 
 // ─── Analytics ───────────────────────────────────────────────────────────────

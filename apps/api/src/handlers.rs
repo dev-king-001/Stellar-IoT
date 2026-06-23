@@ -1,16 +1,11 @@
 use crate::analytics;
 use crate::models::{
     AnalyticsQuery, Device, DeviceSearchQuery, DeviceSearchResponse,
-    PaymentRequest, PaymentResponse, Session, HeartbeatRequest, TelemetryUpload,
+    PaymentRequest, PaymentResponse, Session, HeartbeatRequest, TelemetryUploadRequest,
 };
 use crate::services;
-use crate::webhook::WebhookEventType;
-use crate::webhook_service::{dispatch_event, WebhookStore};
 use axum::{
-    extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, Query, State,
-    },
+    extract::{Path, Query, ws::{WebSocketUpgrade, WebSocket, Message}},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -18,7 +13,6 @@ use axum::{
 use serde::Deserialize;
 
 /// Get all available devices (unchanged — keeps backwards compatibility).
-#[allow(dead_code)]
 pub async fn get_devices() -> Json<Vec<Device>> {
     Json(services::get_mock_devices())
 }
@@ -29,49 +23,28 @@ pub async fn search_devices(Query(query): Query<DeviceSearchQuery>) -> Json<Devi
 }
 
 /// Process payment and grant access with Stellar verification.
-/// On success, fires `payment_received` and `access_granted` webhook events.
 pub async fn process_payment(
-    State(store): State<WebhookStore>,
     Json(payment): Json<PaymentRequest>,
 ) -> Result<Json<PaymentResponse>, StatusCode> {
+    // 1. Verify payment on Stellar
     match services::verify_payment(&payment.tx_hash, &payment.device_id, &payment.user_address)
         .await
     {
         Ok(true) => {
-            let session = services::create_session(payment.device_id.clone(), payment.user_address.clone());
-
-            // Fire payment_received event
-            tokio::spawn(dispatch_event(
-                store.clone(),
-                payment.device_id.clone(),
-                WebhookEventType::PaymentReceived,
-                serde_json::json!({
-                    "tx_hash": payment.tx_hash,
-                    "user_address": payment.user_address,
-                    "amount": payment.amount,
-                }),
-            ));
-
-            // Fire access_granted event
-            tokio::spawn(dispatch_event(
-                store.clone(),
-                payment.device_id.clone(),
-                WebhookEventType::AccessGranted,
-                serde_json::json!({
-                    "session_id": session.id,
-                    "user_address": session.user_address,
-                    "expires_at": session.expires_at.to_rfc3339(),
-                }),
-            ));
-
+            // Payment verified - grant access and store session in global store
+            let session = services::create_session(payment.device_id, payment.user_address);
             Ok(Json(PaymentResponse {
                 access_granted: true,
                 session_id: session.id,
                 expires_at: session.expires_at.to_rfc3339(),
             }))
         }
-        Ok(false) => Err(StatusCode::CONFLICT),
+        Ok(false) => {
+            // Replay attack detected
+            Err(StatusCode::CONFLICT)
+        }
         Err(msg) => {
+            // Verification failed
             eprintln!("Payment verification failed: {}", msg);
             Err(StatusCode::BAD_REQUEST)
         }
@@ -138,44 +111,45 @@ pub async fn telemetry_ws(
 /// Send live telemetry data packets to the client.
 async fn handle_telemetry_socket(mut socket: WebSocket, session_id: String) {
     // Verify session exists
-    let device_id = match services::get_session(&session_id) {
-        Some(s) => s.device_id,
+    let session = match services::get_session(&session_id) {
+        Some(s) => s,
         None => {
             let _ = socket.send(Message::Text("Session not found".to_string())).await;
             return;
         }
     };
 
-    let mut rx = services::get_telemetry_receiver(&device_id);
+    let mut rx = services::subscribe_telemetry(&session.device_id);
 
     loop {
         tokio::select! {
             result = rx.recv() => {
-                let data = match result {
-                    Ok(data) => data,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                };
-                let current_session = match services::get_session(&session_id) {
-                    Some(s) => s,
-                    None => break,
-                };
+                match result {
+                    Ok(data) => {
+                        // Check if session remains active
+                        let current_session = match services::get_session(&session_id) {
+                            Some(s) => s,
+                            None => break,
+                        };
+                        let now = chrono::Utc::now();
+                        if !current_session.active || current_session.expires_at < now {
+                            let _ = socket.send(Message::Text(serde_json::json!({
+                                "error": "Session expired or terminated",
+                                "active": false
+                            }).to_string())).await;
+                            break;
+                        }
 
-                let now = chrono::Utc::now();
-                if !current_session.active || current_session.expires_at < now {
-                    let _ = socket.send(Message::Text(serde_json::json!({
-                        "error": "Session expired or terminated",
-                        "active": false
-                    }).to_string())).await;
-                    break;
-                }
-
-                if let Ok(msg_text) = serde_json::to_string(&data) {
-                    if socket.send(Message::Text(msg_text)).await.is_err() {
-                        break;
+                        if let Ok(msg_text) = serde_json::to_string(&data) {
+                            if socket.send(Message::Text(msg_text)).await.is_err() {
+                                break;
+                            }
+                        }
                     }
-                } else {
-                    break;
+                    Err(_) => {
+                        // Lagged or closed
+                        continue;
+                    }
                 }
             }
             msg = socket.recv() => {
@@ -189,6 +163,14 @@ async fn handle_telemetry_socket(mut socket: WebSocket, session_id: String) {
 }
 
 /// `GET /devices/:id/analytics`
+///
+/// Query params:
+/// - `period`   – daily | weekly | monthly  (default: daily)
+/// - `lookback` – number of periods to include (default: 30/12/12)
+/// - `format`   – json | csv  (default: json)
+///
+/// Returns a full analytics report for the device owner.
+/// Use `format=csv` for an exportable spreadsheet.
 pub async fn get_device_analytics(
     Path(id): Path<String>,
     Query(query): Query<AnalyticsQuery>,
@@ -212,8 +194,14 @@ pub async fn get_device_analytics(
             Ok(csv) => (
                 StatusCode::OK,
                 [
-                    (header::CONTENT_TYPE, "text/csv; charset=utf-8"),
-                    (header::CONTENT_DISPOSITION, "attachment; filename=\"analytics.csv\""),
+                    (
+                        header::CONTENT_TYPE,
+                        "text/csv; charset=utf-8",
+                    ),
+                    (
+                        header::CONTENT_DISPOSITION,
+                        "attachment; filename=\"analytics.csv\"",
+                    ),
                 ],
                 csv,
             )
@@ -239,14 +227,17 @@ pub async fn device_heartbeat(
         Err(_) => Err(StatusCode::NOT_FOUND),
     }
 }
-/// Process telemetry upload from device.
+
+/// Process telemetry data ingestion.
 pub async fn upload_telemetry(
     Path(id): Path<String>,
-    Json(payload): Json<TelemetryUpload>,
+    Json(payload): Json<TelemetryUploadRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    if !services::has_active_session(&id) {
-        return Err(StatusCode::FORBIDDEN);
-    }
-    services::ingest_telemetry(&id, payload.readings);
-    Ok(StatusCode::ACCEPTED)
+    let _session = match services::get_session(&payload.session_id) {
+        Some(s) if s.active && s.device_id == id => s,
+        _ => return Err(StatusCode::UNAUTHORIZED),
+    };
+
+    services::ingest_telemetry(&id, payload.data);
+    Ok(StatusCode::OK)
 }

@@ -55,6 +55,9 @@ export async function registerDevice(data: DeviceRegistrationForm): Promise<Devi
   return response.json()
 }
 
+export function getTelemetryWsUrl(sessionId: string): string {
+  const wsBase = API_URL.replace(/^http/, 'ws')
+  return `${wsBase}/session/${sessionId}/telemetry`
 import { DeviceAnalyticsReport, ReportPeriod } from '@/types'
 
 export async function getDeviceAnalytics(

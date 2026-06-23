@@ -1,6 +1,7 @@
 'use client'
 
 import { useState } from 'react'
+import { useRouter } from 'next/navigation'
 import { Device } from '@/types'
 import { useWallet } from '@/providers/WalletProvider'
 import PaymentModal from './PaymentModal'

@@ -132,6 +132,7 @@ pub struct PaymentError {
 pub struct Session {
     pub id: String,
     pub device_id: String,
+    pub device_name: String,
     pub user_address: String,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
@@ -139,11 +140,12 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(device_id: String, user_address: String) -> Self {
+    pub fn new(device_id: String, device_name: String, user_address: String) -> Self {
         let now = Utc::now();
         Self {
             id: Uuid::new_v4().to_string(),
             device_id,
+            device_name,
             user_address,
             created_at: now,
             expires_at: now + Duration::hours(1),
@@ -152,6 +154,15 @@ impl Session {
     }
 }
 
+// ─── Telemetry Data ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TelemetryData {
+    pub timestamp: String,
+    pub numeric_readings: std::collections::HashMap<String, f64>,
+    pub boolean_readings: std::collections::HashMap<String, bool>,
+    pub string_readings: std::collections::HashMap<String, String>,
+    pub is_abnormal: bool,
 // ─── Analytics ───────────────────────────────────────────────────────────────
 
 /// Granularity for revenue / session time-series.

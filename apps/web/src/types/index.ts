@@ -11,6 +11,7 @@ export interface PaymentRequest {
   device_id: string
   user_address: string
   amount: number
+  tx_hash?: string
 }
 
 export interface PaymentResponse {
